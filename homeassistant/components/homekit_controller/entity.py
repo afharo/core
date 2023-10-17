@@ -68,7 +68,7 @@ class HomeKitEntity(Entity):
             accessory.async_subscribe_config_changed(self._async_config_changed)
         )
         accessory.add_pollable_characteristics(self.pollable_characteristics)
-        await accessory.add_watchable_characteristics(self.watchable_characteristics)
+        accessory.add_watchable_characteristics(self.watchable_characteristics)
 
     async def async_will_remove_from_hass(self) -> None:
         """Prepare to be removed from hass."""

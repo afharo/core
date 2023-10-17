@@ -29,7 +29,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from .config_flow import normalize_hkid
 from .const import (
@@ -43,6 +43,7 @@ from .const import (
     IDENTIFIER_LEGACY_SERIAL_NUMBER,
     IDENTIFIER_SERIAL_NUMBER,
     STARTUP_EXCEPTIONS,
+    SUBSCRIBE_COOLDOWN,
 )
 from .device_trigger import async_fire_triggers, async_setup_triggers_for_entry
 
@@ -67,6 +68,14 @@ def valid_serial_number(serial: str) -> bool:
         return float("".join(serial.rsplit(".", 1))) > 1
     except ValueError:
         return True
+
+
+def _remove_accessory_characteristics(
+    characteristics: set[tuple[int, int]], accessory_id: int
+) -> None:
+    removed = [char for char in characteristics if char[0] != accessory_id]
+    for char in removed:
+        characteristics.remove(char)
 
 
 class HKDevice:
@@ -124,7 +133,7 @@ class HKDevice:
 
         self.available = False
 
-        self.pollable_characteristics: list[tuple[int, int]] = []
+        self.pollable_characteristics: set[tuple[int, int]] = set()
 
         # Never allow concurrent polling of the same accessory or bridge
         self._polling_lock = asyncio.Lock()
@@ -134,7 +143,7 @@ class HKDevice:
         # This is set to True if we can't rely on serial numbers to be unique
         self.unreliable_serial_numbers = False
 
-        self.watchable_characteristics: list[tuple[int, int]] = []
+        self.watchable_characteristics: set[tuple[int, int]] = set()
 
         self._debounced_update = Debouncer(
             hass,
@@ -147,6 +156,8 @@ class HKDevice:
         self._availability_callbacks: set[CALLBACK_TYPE] = set()
         self._config_changed_callbacks: set[CALLBACK_TYPE] = set()
         self._subscriptions: dict[tuple[int, int], set[CALLBACK_TYPE]] = {}
+        self._pending_subscribes: set[tuple[int, int]] = set()
+        self._subscribe_timer: CALLBACK_TYPE | None = None
 
     @property
     def entity_map(self) -> Accessories:
@@ -162,26 +173,45 @@ class HKDevice:
         self, characteristics: list[tuple[int, int]]
     ) -> None:
         """Add (aid, iid) pairs that we need to poll."""
-        self.pollable_characteristics.extend(characteristics)
+        self.pollable_characteristics.update(characteristics)
 
     def remove_pollable_characteristics(self, accessory_id: int) -> None:
         """Remove all pollable characteristics by accessory id."""
-        self.pollable_characteristics = [
-            char for char in self.pollable_characteristics if char[0] != accessory_id
-        ]
+        _remove_accessory_characteristics(self.pollable_characteristics, accessory_id)
 
-    async def add_watchable_characteristics(
+    def add_watchable_characteristics(
         self, characteristics: list[tuple[int, int]]
     ) -> None:
         """Add (aid, iid) pairs that we need to poll."""
-        self.watchable_characteristics.extend(characteristics)
-        await self.pairing.subscribe(characteristics)
+        self.watchable_characteristics.update(characteristics)
+        self._pending_subscribes.update(characteristics)
+        # Try to subscribe to the characteristics all at once
+        if not self._subscribe_timer:
+            self._subscribe_timer = async_call_later(
+                self.hass,
+                SUBSCRIBE_COOLDOWN,
+                self._async_subscribe,
+            )
+
+    @callback
+    def _async_cancel_subscription_timer(self) -> None:
+        """Cancel the subscribe timer."""
+        if self._subscribe_timer:
+            self._subscribe_timer()
+            self._subscribe_timer = None
+
+    async def _async_subscribe(self, _now: datetime) -> None:
+        """Subscribe to characteristics."""
+        self._subscribe_timer = None
+        if self._pending_subscribes:
+            subscribes = self._pending_subscribes.copy()
+            self._pending_subscribes.clear()
+            await self.pairing.subscribe(subscribes)
 
     def remove_watchable_characteristics(self, accessory_id: int) -> None:
         """Remove all pollable characteristics by accessory id."""
-        self.watchable_characteristics = [
-            char for char in self.watchable_characteristics if char[0] != accessory_id
-        ]
+        _remove_accessory_characteristics(self.pollable_characteristics, accessory_id)
+        _remove_accessory_characteristics(self._pending_subscribes, accessory_id)
 
     @callback
     def async_set_available_state(self, available: bool) -> None:
@@ -263,6 +293,9 @@ class HKDevice:
         )
         entry.async_on_unload(
             pairing.dispatcher_availability_changed(self.async_set_available_state)
+        )
+        entry.async_on_unload(
+            self._async_cancel_subscription_timer,
         )
 
         await self.async_process_entity_map()
