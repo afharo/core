@@ -73,7 +73,7 @@ def valid_serial_number(serial: str) -> bool:
 def _remove_accessory_characteristics(
     characteristics: set[tuple[int, int]], accessory_id: int
 ) -> None:
-    removed = [char for char in characteristics if char[0] != accessory_id]
+    removed = [char for char in characteristics if char[0] == accessory_id]
     for char in removed:
         characteristics.remove(char)
 
